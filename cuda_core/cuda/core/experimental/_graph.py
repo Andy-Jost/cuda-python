@@ -324,12 +324,12 @@ class GraphBuilder:
             raise RuntimeError(f"Graph instantiation failed with unexpected error code: {params.result_out}")
         return graph
 
-    def debug_dot_print(self, path, options: GraphDebugPrintOptions | None = None):
+    def debug_dot_print(self, path: str | bytes, options: GraphDebugPrintOptions | None = None):
         """Generates a DOT debug file for the graph builder.
 
         Parameters
         ----------
-        path : str
+        path : str | bytes
             File path to use for writting debug DOT output
         options : :obj:`~_graph.GraphDebugPrintOptions`, optional
             Customizable dataclass for the debug print options.
@@ -371,6 +371,9 @@ class GraphBuilder:
                 flags |= driver.CUgraphDebugDot_flags.CU_GRAPH_DEBUG_DOT_FLAGS_EXTRA_TOPO_INFO
             if options.conditional_node_params:
                 flags |= driver.CUgraphDebugDot_flags.CU_GRAPH_DEBUG_DOT_FLAGS_CONDITIONAL_NODE_PARAMS
+
+        if isinstance(path, str):
+          path = path.encode("utf-8")
 
         handle_return(driver.cuGraphDebugDotPrint(self._mnff.graph, path, flags))
 
