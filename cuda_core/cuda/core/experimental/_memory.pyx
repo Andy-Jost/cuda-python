@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
+import cuda_core_holders_demo as holders
 
 cimport cpython
 from libc.limits cimport ULLONG_MAX
@@ -229,8 +230,9 @@ cdef class Buffer(_cyBuffer, MemoryResourceAttributes):
         cdef cydriver.CUmemPoolPtrExportData data
         memcpy(data.reserved, <const void*><const char*>(ipc_buffer._reserved), sizeof(data.reserved))
         cdef cydriver.CUdeviceptr ptr
+        cdef cydriver.CUmemoryPool mempool = <cydriver.CUmemoryPool><uintptr_t> mr.handle
         with nogil:
-            HANDLE_RETURN(cydriver.cuMemPoolImportPointer(&ptr, mr._mempool_handle, &data))
+            HANDLE_RETURN(cydriver.cuMemPoolImportPointer(&ptr, mempool, &data))
         return Buffer._init(<intptr_t>ptr, ipc_buffer.size, mr, stream)
 
     def copy_to(self, dst: Buffer = None, *, stream: Stream) -> Buffer:
@@ -662,7 +664,7 @@ cdef class DeviceMemoryResource(MemoryResource):
     """
     cdef:
         int _dev_id
-        cydriver.CUmemoryPool _mempool_handle
+        object _handle
         object _attributes
         cydriver.CUmemAllocationHandleType _ipc_handle_type
         bint _mempool_owned
@@ -673,7 +675,7 @@ cdef class DeviceMemoryResource(MemoryResource):
 
     def __cinit__(self):
         self._dev_id = cydriver.CU_DEVICE_INVALID
-        self._mempool_handle = NULL
+        self._handle = None
         self._attributes = None
         self._ipc_handle_type = cydriver.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_MAX
         self._mempool_owned = False
@@ -683,6 +685,7 @@ cdef class DeviceMemoryResource(MemoryResource):
 
     def __init__(self, device_id: int | Device, options=None):
         cdef int dev_id = getattr(device_id, 'device_id', device_id)
+        cdef cydriver.CUmemoryPool mempool
         opts = check_or_create_options(
             DeviceMemoryResourceOptions, options, "DeviceMemoryResource options", keep_none=True
         )
@@ -697,20 +700,23 @@ cdef class DeviceMemoryResource(MemoryResource):
             self._mempool_owned = False
 
             with nogil:
-                HANDLE_RETURN(cydriver.cuDeviceGetMemPool(&(self._mempool_handle), dev_id))
+                HANDLE_RETURN(cydriver.cuDeviceGetMemPool(&mempool, dev_id))
 
+            self._handle = holders.MemPool.capture_static(<uintptr_t> mempool)
+
+            with nogil:
                 # Set a higher release threshold to improve performance when there are no active allocations.
                 # By default, the release threshold is 0, which means memory is immediately released back
                 # to the OS when there are no active suballocations, causing performance issues.
                 # Check current release threshold
                 HANDLE_RETURN(cydriver.cuMemPoolGetAttribute(
-                    self._mempool_handle, cydriver.CUmemPool_attribute.CU_MEMPOOL_ATTR_RELEASE_THRESHOLD, &current_threshold)
+                    mempool, cydriver.CUmemPool_attribute.CU_MEMPOOL_ATTR_RELEASE_THRESHOLD, &current_threshold)
                 )
 
                 # If threshold is 0 (default), set it to maximum to retain memory in the pool
                 if current_threshold == 0:
                     HANDLE_RETURN(cydriver.cuMemPoolSetAttribute(
-                        self._mempool_handle,
+                        mempool,
                         cydriver.CUmemPool_attribute.CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
                         &max_threshold
                     ))
@@ -733,27 +739,22 @@ cdef class DeviceMemoryResource(MemoryResource):
             self._mempool_owned = True
 
             with nogil:
-                HANDLE_RETURN(cydriver.cuMemPoolCreate(&(self._mempool_handle), &properties))
+                HANDLE_RETURN(cydriver.cuMemPoolCreate(&mempool, &properties))
                 # TODO: should we also set the threshold here?
+
+            self._handle = holders.MemPool.capture(<uintptr_t> mempool)
 
             if opts.ipc_enabled:
                 self.get_allocation_handle()  # enables Buffer.get_ipc_descriptor, sets uuid
 
-    def __dealloc__(self):
-        self.close()
-
     cpdef close(self):
         """Close the device memory resource and destroy the associated memory pool if owned."""
-        if self._mempool_handle == NULL:
-            return
-
         try:
-            if self._mempool_owned:
-                with nogil:
-                    HANDLE_RETURN(cydriver.cuMemPoolDestroy(self._mempool_handle))
+            if self._handle is not None:
+                self._handle.reset()
         finally:
             self._dev_id = cydriver.CU_DEVICE_INVALID
-            self._mempool_handle = NULL
+            self._handle = None
             self._attributes = None
             self._ipc_handle_type = cydriver.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_MAX
             self._mempool_owned = False
@@ -835,6 +836,7 @@ cdef class DeviceMemoryResource(MemoryResource):
         device_id = getattr(device_id, 'device_id', device_id)
 
         cdef DeviceMemoryResource self = DeviceMemoryResource.__new__(cls)
+        cdef cydriver.CUmemoryPool mempool
         self._dev_id = device_id
         self._ipc_handle_type = _IPC_HANDLE_TYPE
         self._mempool_owned = True
@@ -844,8 +846,9 @@ cdef class DeviceMemoryResource(MemoryResource):
         cdef int handle = int(alloc_handle)
         with nogil:
             HANDLE_RETURN(cydriver.cuMemPoolImportFromShareableHandle(
-                &(self._mempool_handle), <void*><intptr_t>(handle), _IPC_HANDLE_TYPE, 0)
+                &mempool, <void*><intptr_t>(handle), _IPC_HANDLE_TYPE, 0)
             )
+        self._handle = holders.MemPool.capture_cached(<uintptr_t> mempool)
         if uuid is not None:
             registered = self.register(uuid)
             assert registered is self
@@ -862,6 +865,7 @@ cdef class DeviceMemoryResource(MemoryResource):
             The shareable handle for the memory pool.
         """
         # Note: This is Linux only (int for file descriptor)
+        cdef cydriver.CUmemoryPool mempool
         cdef int alloc_handle
 
         if self._alloc_handle is None:
@@ -870,9 +874,10 @@ cdef class DeviceMemoryResource(MemoryResource):
             if self._is_mapped:
                 raise RuntimeError("Imported memory resource cannot be exported")
 
+            mempool = <cydriver.CUmemoryPool><uintptr_t> self.handle
             with nogil:
                 HANDLE_RETURN(cydriver.cuMemPoolExportToShareableHandle(
-                    &alloc_handle, self._mempool_handle, _IPC_HANDLE_TYPE, 0)
+                    &alloc_handle, mempool, _IPC_HANDLE_TYPE, 0)
                 )
             try:
                 assert self._uuid is None
@@ -885,10 +890,11 @@ cdef class DeviceMemoryResource(MemoryResource):
         return self._alloc_handle
 
     cdef Buffer _allocate(self, size_t size, cyStream stream):
-        cdef cydriver.CUstream s = stream._handle
+        cdef cydriver.CUmemoryPool mempool = <cydriver.CUmemoryPool><uintptr_t> self.handle
+        cdef cydriver.CUstream s = <cydriver.CUstream><uintptr_t> stream._handle
         cdef cydriver.CUdeviceptr devptr
         with nogil:
-            HANDLE_RETURN(cydriver.cuMemAllocFromPoolAsync(&devptr, size, self._mempool_handle, s))
+            HANDLE_RETURN(cydriver.cuMemAllocFromPoolAsync(&devptr, size, mempool, s))
         cdef Buffer buf = Buffer.__new__(Buffer)
         buf._ptr = <intptr_t>(devptr)
         buf._ptr_obj = None
@@ -921,7 +927,7 @@ cdef class DeviceMemoryResource(MemoryResource):
         return self._allocate(size, <cyStream>stream)
 
     cdef void _deallocate(self, intptr_t ptr, size_t size, cyStream stream) noexcept:
-        cdef cydriver.CUstream s = stream._handle
+        cdef cydriver.CUstream s = <cydriver.CUstream><uintptr_t> stream._handle
         cdef cydriver.CUdeviceptr devptr = <cydriver.CUdeviceptr>ptr
         with nogil:
             HANDLE_RETURN(cydriver.cuMemFreeAsync(devptr, s))
@@ -957,7 +963,7 @@ cdef class DeviceMemoryResource(MemoryResource):
     @property
     def handle(self) -> driver.CUmemoryPool:
         """Handle to the underlying memory pool."""
-        return driver.CUmemoryPool(<uintptr_t>(self._mempool_handle))
+        return driver.CUmemoryPool(<uintptr_t>(self._handle))
 
     @property
     def is_handle_owned(self) -> bool:
