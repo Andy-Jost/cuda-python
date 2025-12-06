@@ -84,11 +84,22 @@ def _build_cuda_core():
         print("CUDA paths:", CUDA_PATH)
         return CUDA_PATH
 
+    def get_sources(mod_name):
+        """Get source files for a module, including any .cpp files."""
+        sources = [f"cuda/core/experimental/{mod_name}.pyx"]
+        # Add _impl.cpp file if it exists (to avoid conflict with Cython-generated .cpp)
+        cpp_file = f"cuda/core/experimental/{mod_name}_impl.cpp"
+        if os.path.exists(cpp_file):
+            sources.append(cpp_file)
+        return sources
+
     ext_modules = tuple(
         Extension(
             f"cuda.core.experimental.{mod.replace(os.path.sep, '.')}",
-            sources=[f"cuda/core/experimental/{mod}.pyx"],
-            include_dirs=list(os.path.join(root, "include") for root in get_cuda_paths()),
+            sources=get_sources(mod),
+            include_dirs=[
+                "cuda/core/experimental/include",
+            ] + list(os.path.join(root, "include") for root in get_cuda_paths()),
             language="c++",
         )
         for mod in module_names
